@@ -1,9 +1,11 @@
 """
 环境快照记录器
-记录: Claude Code Skills + Python 库 + npm 全局包
+记录: Claude Code / OpenClaw / Codex / Cursor Skills & Rules + Pip + npm
 用法:
     python record_env.py           # 保存快照
-    python record_env.py --diff    # 对比上次快照，显示新增
+    python record_env.py --diff    # 对比变化
+    python record_env.py --list    # 列出所有
+    python record_env.py --web     # 网页查看器
 """
 
 import json
@@ -16,17 +18,31 @@ from datetime import datetime, timezone, timedelta
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
-# 快照文件默认存在工具目录下，可通过环境变量 ENV_SNAPSHOT_FILE 自定义
+# ---- 配置 ----
+
 SNAPSHOT_FILE = os.environ.get(
     "ENV_SNAPSHOT_FILE",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "env_snapshots.json")
 )
-# Skills 全局目录（Claude Code 默认），不存在则跳过
-GLOBAL_SKILLS_DIR = os.path.expanduser("~/.claude/skills")
 
+PROJECT_ROOTS = [
+    os.path.expanduser("~/Documents/Codex"),
+    "C:/Work",
+]
+
+# (工具名, 全局目录, 项目级目录, 类型 skill/rule)
+AI_AGENTS = [
+    ("Claude Code", "~/.claude/skills", ".claude/skills", "skill"),
+    ("OpenClaw", "~/.openclaw/skills", ".openclaw/skills", "skill"),
+    ("Codex", "~/.codex/skills", ".codex/skills", "skill"),
+    ("Codex Rules", "~/.codex/rules", ".codex/rules", "rule"),
+    ("Cursor Rules", None, ".cursor/rules", "rule"),
+]
+
+
+# ---- 工具函数 ----
 
 def _print_columns(items, indent="   ", width=100):
-    """将列表分列打印，每行约 width 字符"""
     if not items:
         return
     max_len = max(len(s) for s in items) + 2
@@ -35,39 +51,43 @@ def _print_columns(items, indent="   ", width=100):
         row = indent + "  ".join(s.ljust(max_len) for s in items[i:i + cols])
         print(row)
 
-# 需要扫描的项目根目录（含 .claude/skills 的目录）
-# 工具会自动扫描这些目录下所有子目录的 .claude/skills
-PROJECT_ROOTS = [
-    os.path.expanduser("~/Documents/Codex"),
-    "C:/Work",
-    # 添加更多目录: "D:/Projects",
-]
 
+# ---- AI Agent Skills/Rules 扫描 ----
 
-def _scan_skills_dir(directory, scope, project_name=None):
-    """扫描一个 skills 目录，返回 skill 列表"""
-    skills = []
-    if os.path.isdir(directory):
-        for name in os.listdir(directory):
-            path = os.path.join(directory, name)
+def _scan_ai_dir(directory, scope, project_name, item_type="skill"):
+    items = []
+    if not directory or not os.path.isdir(directory):
+        return items
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name)
+        if item_type == "skill":
             if os.path.isdir(path):
                 skill_md = os.path.join(path, "SKILL.md")
-                s = {
-                    "name": name,
-                    "scope": scope,
-                    "project": project_name,
-                    "has_skill_md": os.path.exists(skill_md),
-                }
-                skills.append(s)
-    return skills
+                items.append({"name": name, "scope": scope, "project": project_name,
+                              "type": "skill", "has_md": os.path.exists(skill_md)})
+        elif item_type == "rule":
+            if os.path.isfile(path) and (name.endswith(".rules") or name.endswith(".md")):
+                items.append({"name": name, "scope": scope, "project": project_name,
+                              "type": "rule", "has_md": True})
+    return items
 
 
-def _find_project_skills():
-    """扫描所有已知项目的 .claude/skills 目录"""
-    all_skills = []
+def _find_ai_items():
+    all_items = []
     scanned = set()
 
-    # 扫描所有 PROJECT_ROOTS 下的子目录
+    # 1. 全局
+    for tool_name, global_dir, proj_dir, item_type in AI_AGENTS:
+        if global_dir:
+            gdir = os.path.expanduser(global_dir)
+            real = os.path.realpath(gdir) if os.path.exists(gdir) else gdir
+            if real not in scanned:
+                scanned.add(real)
+                for item in _scan_ai_dir(gdir, "global", None, item_type):
+                    item["tool"] = tool_name
+                    all_items.append(item)
+
+    # 2. 项目级
     for root in PROJECT_ROOTS:
         if not os.path.isdir(root):
             continue
@@ -75,33 +95,40 @@ def _find_project_skills():
             proj_path = os.path.join(root, entry)
             if not os.path.isdir(proj_path):
                 continue
-            skills_path = os.path.join(proj_path, ".claude", "skills")
-            real_path = os.path.realpath(skills_path)  # 规范化路径
-            if os.path.isdir(skills_path) and real_path not in scanned:
-                scanned.add(real_path)
-                all_skills.extend(_scan_skills_dir(skills_path, "project", entry))
+            for tool_name, global_dir, proj_rel_dir, item_type in AI_AGENTS:
+                if not proj_rel_dir:
+                    continue
+                ai_dir = os.path.join(proj_path, proj_rel_dir)
+                real = os.path.realpath(ai_dir) if os.path.exists(ai_dir) else ai_dir
+                if real not in scanned and os.path.isdir(ai_dir):
+                    scanned.add(real)
+                    for item in _scan_ai_dir(ai_dir, "project", entry, item_type):
+                        item["tool"] = tool_name
+                        all_items.append(item)
 
-    # 也扫当前项目（如果不在已扫描目录中）
+    # 3. 当前项目
     cwd = os.getcwd()
-    cwd_skills = os.path.join(cwd, ".claude", "skills")
-    cwd_real = os.path.realpath(cwd_skills)
-    if cwd_real not in scanned and os.path.isdir(cwd_skills):
-        scanned.add(cwd_real)
-        proj_name = os.path.basename(cwd)
-        all_skills.extend(_scan_skills_dir(cwd_skills, "project", proj_name))
+    for tool_name, global_dir, proj_rel_dir, item_type in AI_AGENTS:
+        if not proj_rel_dir:
+            continue
+        ai_dir = os.path.join(cwd, proj_rel_dir)
+        real = os.path.realpath(ai_dir) if os.path.exists(ai_dir) else ai_dir
+        if real not in scanned and os.path.isdir(ai_dir):
+            scanned.add(real)
+            for item in _scan_ai_dir(ai_dir, "project", os.path.basename(cwd), item_type):
+                item["tool"] = tool_name
+                all_items.append(item)
 
-    return all_skills
+    return all_items
 
 
 def get_skills():
-    """获取所有 Skills（全局 + 所有项目级）"""
-    skills = _scan_skills_dir(GLOBAL_SKILLS_DIR, "global", None)
-    skills.extend(_find_project_skills())
-    return sorted(skills, key=lambda s: (s["scope"], s.get("project") or "", s["name"]))
+    return sorted(_find_ai_items(), key=lambda s: (s["scope"], s.get("tool") or "", s["name"]))
 
+
+# ---- Pip 扫描 ----
 
 def _run_pip_list(args=None):
-    """运行 pip list 并返回解析结果"""
     cmd = [sys.executable, "-m", "pip", "list", "--format=json"]
     if args:
         cmd.extend(args)
@@ -113,7 +140,6 @@ def _run_pip_list(args=None):
 
 
 def get_pip_global():
-    """获取全局 pip 包"""
     pkgs = _run_pip_list(["--user"])
     if not pkgs:
         pkgs = _run_pip_list()
@@ -122,33 +148,24 @@ def get_pip_global():
 
 
 def get_pip_project():
-    """获取当前项目虚拟环境的 pip 包"""
-    # 检测是否在虚拟环境中
     in_venv = sys.prefix != sys.base_prefix
     if not in_venv:
         return []
-
-    # 虚拟环境中的所有包（排除标准库）
     all_pkgs = _run_pip_list()
     global_pkgs = _run_pip_list(["--user"])
     global_names = {p["name"] for p in (global_pkgs or [])}
-
-    # 项目级 = venv 全部 - 已在全局的
     project_pkgs = [p for p in all_pkgs if p["name"] not in global_names]
     return [{"name": p["name"], "version": p.get("version", "?"), "scope": "project"}
             for p in sorted(project_pkgs, key=lambda x: x["name"])]
 
 
 def get_all_pip():
-    """获取所有 pip 包（全局 + 项目）"""
-    pkgs = get_pip_global()
-    pkgs.extend(get_pip_project())
-    return pkgs
+    return get_pip_global() + get_pip_project()
 
+
+# ---- npm 扫描 ----
 
 def _find_npm():
-    """找到 npm 可执行文件路径"""
-    # .cmd 优先（Windows），然后直接名
     candidates = [
         os.path.expanduser("~/Programs/Dev/nodejs/npm.cmd"),
         os.path.expanduser("~/Programs/Dev/nodejs/npm"),
@@ -158,11 +175,10 @@ def _find_npm():
     for c in candidates:
         if os.path.isfile(c):
             return c
-    return "npm.cmd"  # 最后尝试系统 PATH
+    return "npm.cmd"
 
 
 def get_npm_packages(scope, args):
-    """获取 npm 包"""
     npm = _find_npm()
     try:
         result = subprocess.run(
@@ -178,12 +194,10 @@ def get_npm_packages(scope, args):
 
 
 def get_npm_global():
-    """获取 npm 全局安装的包"""
     return get_npm_packages("global", ["-g"])
 
 
 def get_npm_project():
-    """获取当前项目 node_modules 的包"""
     cwd = os.getcwd()
     node_modules = os.path.join(cwd, "node_modules")
     if not os.path.isdir(node_modules):
@@ -192,12 +206,10 @@ def get_npm_project():
 
 
 def get_all_npm():
-    """获取所有 npm 包（全局 + 项目）"""
     return get_npm_global() + get_npm_project()
 
 
 def _get_npm_root():
-    """获取 npm 全局安装根目录"""
     npm = _find_npm()
     try:
         r = subprocess.run([npm, "root", "-g"], capture_output=True, text=True, timeout=5)
@@ -206,26 +218,25 @@ def _get_npm_root():
         return "~/.npm/"
 
 
+# ---- 快照 ----
+
 def take_snapshot():
-    """拍摄当前环境快照"""
     tz = timezone(timedelta(hours=8))
     now = datetime.now(tz).isoformat()
 
     snapshot = {
         "time": now,
-        "skills": get_skills(),
+        "ai_agents": get_skills(),
         "pip_packages": get_all_pip(),
-        "npm_global": get_all_npm(),
+        "npm_packages": get_all_npm(),
     }
 
-    # 加载历史记录
     history = []
     if os.path.exists(SNAPSHOT_FILE):
         with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
             history = json.load(f)
 
     history.append(snapshot)
-    # 只保留最近 50 条
     history = history[-50:]
 
     with open(SNAPSHOT_FILE, "w", encoding="utf-8") as f:
@@ -237,198 +248,169 @@ def take_snapshot():
 
 def _print_summary(s):
     print(f"\n{'='*50}")
-    print(f"  环境快照已保存 - {s['time'][:19]}")
+    print(f"  环境快照 - {s['time'][:19]}")
     print(f"{'='*50}")
 
-    # Skills 按来源分组列出
-    global_skills = [sk for sk in s["skills"] if sk.get("scope") == "global"]
-    proj_groups = {}
-    for sk in s["skills"]:
-        if sk.get("scope") == "project":
-            p = sk.get("project", "unknown")
-            proj_groups.setdefault(p, []).append(sk["name"])
+    ai = s.get("ai_agents", s.get("skills", []))
+    # 按工具分组
+    tool_groups = {}
+    for item in ai:
+        tool = item.get("tool", "Claude Code")
+        scope = item.get("scope", "global")
+        key = f"🌐 {tool} 全局" if scope == "global" else f"📁 {tool} [{item.get('project', '?')}]"
+        tool_groups.setdefault(key, []).append(item["name"])
 
-    print(f"\n📦 Skills:  {len(s['skills'])} 个")
-    print(f"   🌐 全局 ({len(global_skills)}) 路径: ~/.claude/skills/")
-    print(f"      {', '.join(sk['name'] for sk in global_skills)}")
-    for proj, names in sorted(proj_groups.items()):
-        print(f"   📁 {proj} ({len(names)}) 路径: <项目>/.claude/skills/")
-        print(f"      {', '.join(names)}")
+    print(f"\n🤖 AI Agents:  {len(ai)} 个")
+    for group, names in sorted(tool_groups.items()):
+        print(f"   {group} ({len(names)}): {', '.join(names)}")
 
-    # Pip — 分全局和项目
-    pip_global = [p for p in s["pip_packages"] if p.get("scope") == "global"]
-    pip_project = [p for p in s["pip_packages"] if p.get("scope") == "project"]
-    print(f"\n🐍 Pip 包:  {len(s['pip_packages'])} 个")
-    if pip_global:
-        names = [p["name"] for p in pip_global]
-        print(f"   🌐 全局 ({len(pip_global)}) 路径: {site.getusersitepackages()}")
-        _print_columns(names, indent="      ")
-    if pip_project:
-        names = [p["name"] for p in pip_project]
-        print(f"   📁 项目 venv ({len(pip_project)}) 路径: {sys.prefix}")
+    pip = s.get("pip_packages", [])
+    pip_g = [p for p in pip if p.get("scope") == "global"]
+    pip_pj = [p for p in pip if p.get("scope") == "project"]
+    print(f"\n🐍 Pip:  {len(pip)} 个 ({len(pip_g)} 全局 + {len(pip_pj)} 项目)")
 
-    # npm — 分全局和项目
-    npm_global = [p for p in s["npm_global"] if p.get("scope") == "global"]
-    npm_project = [p for p in s["npm_global"] if p.get("scope") == "project"]
-    if npm_global or npm_project:
-        print(f"\n📦 npm:  {len(s['npm_global'])} 个")
-        if npm_global:
-            npm_root = _get_npm_root()
-            names = [p["name"] for p in npm_global]
-            print(f"   🌐 全局 ({len(npm_global)}) 路径: {npm_root}")
-            print(f"      {', '.join(names)}")
-        if npm_project:
-            names = [p["name"] for p in npm_project]
-            print(f"   📁 项目 ({len(npm_project)}) 路径: {os.getcwd()}/node_modules")
-            print(f"      {', '.join(names)}")
+    npm = s.get("npm_packages", s.get("npm_global", []))
+    npm_g = [p for p in npm if p.get("scope") == "global"]
+    npm_pj = [p for p in npm if p.get("scope") == "project"]
+    if npm:
+        print(f"📦 npm:  {len(npm)} 个 ({len(npm_g)} 全局 + {len(npm_pj)} 项目)")
     else:
-        print(f"\n📦 npm: 0 个")
+        print(f"📦 npm:  0 个")
 
+
+# ---- 对比 ----
 
 def show_diff():
-    """对比最近两次快照的差异"""
     if not os.path.exists(SNAPSHOT_FILE):
-        print("还没有快照，先运行 python record_env.py")
+        print("还没有快照")
         return
-
     with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
         history = json.load(f)
-
     if len(history) < 2:
-        print(f"只有 {len(history)} 条快照，需要至少 2 条才能对比")
+        print(f"只有 {len(history)} 条快照")
         return
 
     old = history[-2]
     new = history[-1]
-
     print(f"\n对比: {old['time'][:19]} → {new['time'][:19]}")
 
-    # Skills 变化
-    old_skills = {s["name"] for s in old["skills"]}
-    new_skills = {s["name"] for s in new["skills"]}
-    added_skills = new_skills - old_skills
-    removed_skills = old_skills - new_skills
-
-    if added_skills:
-        print(f"\n➕ 新增 Skills ({len(added_skills)}):")
-        for s in sorted(added_skills):
+    old_ai = {s["name"] for s in old.get("ai_agents", old.get("skills", []))}
+    new_ai = {s["name"] for s in new.get("ai_agents", new.get("skills", []))}
+    added = new_ai - old_ai
+    removed = old_ai - new_ai
+    if added:
+        print(f"\n➕ 新增 AI Agent 项目 ({len(added)}):")
+        for s in sorted(added):
             print(f"   + {s}")
-    if removed_skills:
-        print(f"\n➖ 移除 Skills ({len(removed_skills)}):")
-        for s in sorted(removed_skills):
+    if removed:
+        print(f"\n➖ 移除 AI Agent 项目 ({len(removed)}):")
+        for s in sorted(removed):
             print(f"   - {s}")
-    if not added_skills and not removed_skills:
-        print("\n   Skills: 无变化")
+    if not added and not removed:
+        print("\n   AI Agents: 无变化")
 
-    # Pip 包变化
-    old_pkgs = {p["name"]: p.get("version", "?") for p in old["pip_packages"]}
-    new_pkgs = {p["name"]: p.get("version", "?") for p in new["pip_packages"]}
-    added_pkgs = {k: v for k, v in new_pkgs.items() if k not in old_pkgs}
-    removed_pkgs = {k: v for k, v in old_pkgs.items() if k not in new_pkgs}
-    upgraded_pkgs = {}
-    for k in set(old_pkgs) & set(new_pkgs):
-        if old_pkgs[k] != new_pkgs[k]:
-            upgraded_pkgs[k] = (old_pkgs[k], new_pkgs[k])
-
-    if added_pkgs:
-        print(f"\n➕ 新增 Pip 包 ({len(added_pkgs)}):")
-        for name, ver in sorted(added_pkgs.items()):
+    old_pkgs = {p["name"]: p.get("version", "?") for p in old.get("pip_packages", [])}
+    new_pkgs = {p["name"]: p.get("version", "?") for p in new.get("pip_packages", [])}
+    added_p = {k: v for k, v in new_pkgs.items() if k not in old_pkgs}
+    removed_p = {k: v for k, v in old_pkgs.items() if k not in new_pkgs}
+    if added_p:
+        print(f"\n➕ 新增 Pip ({len(added_p)}):")
+        for name, ver in sorted(added_p.items()):
             print(f"   + {name}=={ver}")
-    if removed_pkgs:
-        print(f"\n➖ 移除 Pip 包 ({len(removed_pkgs)}):")
-        for name, ver in sorted(removed_pkgs.items()):
+    if removed_p:
+        print(f"\n➖ 移除 Pip ({len(removed_p)}):")
+        for name, ver in sorted(removed_p.items()):
             print(f"   - {name}=={ver}")
-    if upgraded_pkgs:
-        print(f"\n🔄 版本变化 ({len(upgraded_pkgs)}):")
-        for name, (old_v, new_v) in sorted(upgraded_pkgs.items()):
-            print(f"   ~ {name}: {old_v} → {new_v}")
-    if not added_pkgs and not removed_pkgs and not upgraded_pkgs:
-        print("   Pip 包: 无变化")
+    if not added_p and not removed_p:
+        print("   Pip: 无变化")
 
-    # npm 全局变化
-    old_npm = {p["name"]: p.get("version", "?") for p in old["npm_global"]}
-    new_npm = {p["name"]: p.get("version", "?") for p in new["npm_global"]}
-    added_npm = {k: v for k, v in new_npm.items() if k not in old_npm}
-
-    if added_npm:
-        print(f"\n➕ 新增 npm 全局包 ({len(added_npm)}):")
-        for name, ver in sorted(added_npm.items()):
+    old_npm_key = "npm_packages" if "npm_packages" in old else "npm_global"
+    new_npm_key = "npm_packages" if "npm_packages" in new else "npm_global"
+    old_npm = {p["name"]: p.get("version", "?") for p in old.get(old_npm_key, [])}
+    new_npm = {p["name"]: p.get("version", "?") for p in new.get(new_npm_key, [])}
+    added_n = {k: v for k, v in new_npm.items() if k not in old_npm}
+    if added_n:
+        print(f"\n➕ 新增 npm ({len(added_n)}):")
+        for name, ver in sorted(added_n.items()):
             print(f"   + {name}@{ver}")
-    elif not added_npm:
-        pass  # npm 变化不单独提示
 
+
+# ---- 列表 ----
 
 def list_current():
-    """列出当前环境的所有内容"""
     s = {
-        "skills": get_skills(),
+        "ai_agents": get_skills(),
         "pip_packages": get_all_pip(),
-        "npm_global": get_all_npm(),
+        "npm_packages": get_all_npm(),
     }
     print(f"\n{'='*50}")
     print(f"  当前环境")
     print(f"{'='*50}")
 
-    # Skills — 按来源分组显示
-    print(f"\n📦 Skills ({len(s['skills'])}):")
-    # 分组: global → 各项目
+    ai = s["ai_agents"]
     groups = {}
-    for sk in s["skills"]:
-        key = "🌐 全局" if sk["scope"] == "global" else f"📁 {sk.get('project', 'unknown')}"
-        groups.setdefault(key, []).append(sk)
+    for item in ai:
+        tool = item.get("tool", "?")
+        scope = item.get("scope", "global")
+        proj = item.get("project", "")
+        if scope == "global":
+            key = f"🌐 {tool} 全局"
+        else:
+            key = f"📁 {tool} [{proj}]"
+        groups.setdefault(key, []).append(item)
 
-    for group_name, items in groups.items():
-        print(f"\n  {group_name} ({len(items)}):")
-        for sk in items:
-            md_flag = "📄" if sk["has_skill_md"] else "📁"
-            print(f"     {md_flag} {sk['name']}")
+    print(f"\n🤖 AI Agents ({len(ai)}):")
+    for group, items in sorted(groups.items()):
+        print(f"\n  {group} ({len(items)}):")
+        for item in items:
+            icon = "📄" if item.get("has_md") else "📁"
+            print(f"     {icon} {item['name']}")
 
-    # Pip — 分全局和项目
-    pip_global = [p for p in s["pip_packages"] if p.get("scope") == "global"]
-    pip_project = [p for p in s["pip_packages"] if p.get("scope") == "project"]
-    print(f"\n🐍 Pip 包 ({len(s['pip_packages'])}):")
-    if pip_global:
-        print(f"\n  🌐 全局 ({len(pip_global)}):")
-        for pkg in pip_global:
+    pip = s["pip_packages"]
+    pip_g = [p for p in pip if p.get("scope") == "global"]
+    pip_pj = [p for p in pip if p.get("scope") == "project"]
+    print(f"\n🐍 Pip ({len(pip)}):")
+    if pip_g:
+        print(f"\n  🌐 全局 ({len(pip_g)}):")
+        for pkg in pip_g:
             print(f"     {pkg['name']}=={pkg['version']}")
-    if pip_project:
-        print(f"\n  📁 项目 venv ({len(pip_project)}):")
-        for pkg in pip_project:
+    if pip_pj:
+        print(f"\n  📁 项目 ({len(pip_pj)}):")
+        for pkg in pip_pj:
             print(f"     {pkg['name']}=={pkg['version']}")
 
-    # npm — 分全局和项目
-    npm_global = [p for p in s["npm_global"] if p.get("scope") == "global"]
-    npm_project = [p for p in s["npm_global"] if p.get("scope") == "project"]
-    if npm_global or npm_project:
-        print(f"\n📦 npm ({len(s['npm_global'])}):")
-        if npm_global:
-            print(f"\n  🌐 全局 ({len(npm_global)}):")
-            for pkg in npm_global:
+    npm = s["npm_packages"]
+    npm_g = [p for p in npm if p.get("scope") == "global"]
+    npm_pj = [p for p in npm if p.get("scope") == "project"]
+    if npm:
+        print(f"\n📦 npm ({len(npm)}):")
+        if npm_g:
+            print(f"\n  🌐 全局 ({len(npm_g)}):")
+            for pkg in npm_g:
                 print(f"     {pkg['name']}@{pkg['version']}")
-        if npm_project:
-            print(f"\n  📁 项目 ({len(npm_project)}):")
-            for pkg in npm_project:
+        if npm_pj:
+            print(f"\n  📁 项目 ({len(npm_pj)}):")
+            for pkg in npm_pj:
                 print(f"     {pkg['name']}@{pkg['version']}")
 
+
+# ---- 入口 ----
 
 if __name__ == "__main__":
-    # 支持 --path 自定义快照文件路径
     if "--path" in sys.argv:
         idx = sys.argv.index("--path")
         if idx + 1 < len(sys.argv):
             SNAPSHOT_FILE = sys.argv[idx + 1]
-            sys.argv.pop(idx)  # 移除 --path
-            sys.argv.pop(idx)  # 移除值
+            sys.argv.pop(idx)
+            sys.argv.pop(idx)
 
     if len(sys.argv) > 1 and sys.argv[1] == "--diff":
         show_diff()
     elif len(sys.argv) > 1 and sys.argv[1] == "--list":
         list_current()
     elif len(sys.argv) > 1 and sys.argv[1] == "--web":
-        # 启动本地 HTTP 服务器 + 打开网页
         import threading, http.server, webbrowser
         tools_dir = os.path.dirname(os.path.abspath(__file__))
-        # HTTP 服务根目录 = tools/，快照文件和 viewer 都在这个目录下
         os.chdir(tools_dir)
         server = http.server.HTTPServer(("127.0.0.1", 8765), http.server.SimpleHTTPRequestHandler)
         t = threading.Thread(target=server.serve_forever, daemon=True)
